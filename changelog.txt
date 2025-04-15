@@ -1,0 +1,15 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2025-04-15
+  Info:
+    - Initial release.
+  Major Features:
+    - Inserters and entities supporting drop positions may be configured to restrict their interaction to specific inventories of their targets.
+  Features:
+    - Circuit network interface allows automated inventory assignment based on circuit network signals.
+    - Various Remote APIs are provided to permit mod interaction and integration.
+      Control API for managing configured settings of inventory selectors on supported entities.
+      Passthrough API providing conflict-free interaction with "apparent" pickup and drop targets of entities, even when otherwise hidden by this implementation.
+      Unified Inventory Type API for querying entity-specific mappings for unified inventory types as well as registration of custom mappings for modded entities.
+  Gui:
+    - Adds panels to relevant entity GUIs for configuring inventory selectors and related circuit network settings.

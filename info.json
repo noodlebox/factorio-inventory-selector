@@ -1,0 +1,19 @@
+{
+  "name": "inventory-selector",
+  "version": "0.1.0",
+  "title": "Inventory Selector",
+  "author": "noodlebox",
+  "homepage": "https://github.com/noodlebox/factorio-inventory-selector",
+  "description": "When machines have multiple inventories, restrict inserter access to a specific one (or grant access to one previously inaccessible). Avoid common pitfalls of confusing fuel, ingredients, and cargo:\n\nPlatforms waiting on a bumbling swarm of logistic bots to prepare deliveries of blue circuits as inserters sit tragically idle beside a silo? Finding train fuel in exciting new places after a quick stop at the wrong depot? Biochambers in your goldfish farm burning legendary fish food?\n\nNever again!",
+  "factorio_version": "2.0",
+  "dependencies": [
+    "base >= 2.0.38"
+  ],
+  "quality_required": false,
+  "rail_bridges_required": false,
+  "space_travel_required": false,
+  "spoiling_required": false,
+  "freezing_required": false,
+  "segmented_units_required": false,
+  "expansion_shaders_required": false
+}
