@@ -342,7 +342,7 @@ function selector:update_proxy_target(target)
 
     -- If the new target is nil or a car type, it should be in the floating list.
     -- These could become invalid without warning (no useful events), so they must be polled regularly for changes.
-    if not target or target.type == "car" or target.train and target.train.state == defines.train_state.manual_control then
+    if self.actual_inventory_type ~= "none" and (not target or target.type == "car" or target.train and target.train.state == defines.train_state.manual_control) then
         storage.floating[id] = true
     else
         storage.floating[id] = nil
@@ -487,6 +487,9 @@ local function set(entity, mode, inventory_type, immediate)
 
     if not inventory_type and not data.inventory_type then
         data:destroy()
+    elseif data.actual_inventory_type == "none" then
+        data.actual_inventory_type = inventory_type
+        data:update_proxy_target()
     else
         data.actual_inventory_type = inventory_type
         data:update_proxy_inventory()
