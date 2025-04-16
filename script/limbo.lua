@@ -35,9 +35,11 @@ local origin = {0, 0}
 -- issues because of the change to the behavior of entity prototype flags concerning automated interaction.
 -- TODO: Open a new bug report for these issues once explored a bit more.
 local limbo = setmetatable({}, {
-    ---@param surface LuaSurface
+    ---@param surface_index uint
     ---@return LuaEntity?
-    __index = function(self, surface)
+    __index = function(self, surface_index)
+        local surface = game.surfaces[surface_index]
+        if not surface then return nil end
         local entity = surface.find_entity("inventory-selector-limbo", origin)
         if not entity then
             -- Any and all flags that can be set to make this entity as invisible and uninteractable as possible
@@ -56,10 +58,9 @@ local limbo = setmetatable({}, {
             entity.active = false
         end
         -- Cache the reference for future lookups
-        self[surface] = entity
+        self[surface_index] = entity
         return entity
     end,
-    __mode = "k",
 })
 
 return limbo

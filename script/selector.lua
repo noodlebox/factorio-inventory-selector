@@ -265,7 +265,7 @@ function selector:update_proxy_inventory()
 
     ::limbo::
     -- The target wasn't valid for some reason, so just prepare a limbo container
-    target = limbo[proxy.surface]
+    target = limbo[proxy.surface_index]
     index = inventory.get_inventory_info(target, "main") or defines.inventory.chest -- 1
 
     ::assign::
@@ -826,6 +826,12 @@ local library = {
     on_load = register_tick_handlers,
     ---@type table<defines.events, function>
     events = {
+        [defines.events.on_surface_cleared] = function (event)
+            limbo[event.surface_index] = nil
+        end,
+        [defines.events.on_surface_deleted] = function (event)
+            limbo[event.surface_index] = nil
+        end,
         [defines.events.on_object_destroyed] = on_object_destroyed,
         [defines.events.on_player_rotated_entity] = on_entity_modified,
         [defines.events.on_player_flipped_entity] = on_entity_modified,
