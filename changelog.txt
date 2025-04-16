@@ -1,4 +1,11 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.2
+Date: 2025-04-16
+  Optimizations:
+    - Allow entities without a stable target to sleep when selected inventory type is "none"
+  Compatibility:
+    - Support interaction with Bob's Adjustable Inserters and Smart Inserters
+---------------------------------------------------------------------------------------------------
 Version: 1.0.1
 Date: 2025-04-16
   Bugfixes:
