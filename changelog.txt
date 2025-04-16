@@ -1,4 +1,11 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.1
+Date: 2025-04-16
+  Bugfixes:
+    - Cache limbo containers by surface_id instead of LuaSurface ([#1](https://github.com/noodlebox/factorio-inventory-selector/issues/1))
+    - Cull misplaced limbo containers ([#1](https://github.com/noodlebox/factorio-inventory-selector/issues/1))
+    - Ensure only one limbo container is created per surface ([#1](https://github.com/noodlebox/factorio-inventory-selector/issues/1))
+---------------------------------------------------------------------------------------------------
 Version: 1.0.0
 Date: 2025-04-15
   Graphics:
