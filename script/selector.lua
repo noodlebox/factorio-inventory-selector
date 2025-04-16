@@ -761,6 +761,26 @@ local function register_tick_handlers()
     end
 end
 
+local register_custom_handlers = function()
+    -- Register handlers for custom events raised by other mods when inserter drop or pickup positions are changed
+
+    -- Smart_Inserters 2.0.0+
+    if remote.interfaces["Smart_Inserters"] and remote.interfaces["Smart_Inserters"]["on_inserter_arm_changed"] then
+        script.on_event(remote.call("Smart_Inserters", "on_inserter_arm_changed"), function (event)
+            if not event.entity or not event.entity.valid then return end
+            notify(event.entity.unit_number)
+        end)
+    end
+
+    -- Bob's Adjustable Inserters 0.18.0+
+    if remote.interfaces["bobinserters"] and remote.interfaces["bobinserters"]["get_changed_position_event_id"] then
+        script.on_event(remote.call("bobinserters", "get_changed_position_event_id"), function (event)
+            if not event.entity or not event.entity.valid then return end
+            notify(event.entity.unit_number)
+        end)
+    end
+end
+
 local library = {
     -- Event Handling
     on_init = function ()
@@ -825,8 +845,12 @@ local library = {
         storage.mourners = {}
 
         register_tick_handlers()
+        register_custom_handlers()
     end,
-    on_load = register_tick_handlers,
+    on_load = function ()
+        register_tick_handlers()
+        register_custom_handlers()
+    end,
     ---@type table<defines.events, function>
     events = {
         [defines.events.on_surface_cleared] = function (event)
