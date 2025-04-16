@@ -45,6 +45,7 @@ local limbo = setmetatable({}, {
             entity = surface.create_entity{
                 name = "inventory-selector-limbo",
                 position = origin,
+                snap_to_grid = false,
                 force = game.forces.neutral,
                 create_build_effect_smoke = false,
                 preserve_ghosts_and_corpses = true,
