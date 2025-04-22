@@ -245,7 +245,7 @@ end
 local function on_gui_checked_state_changed(event)
     local element = event.element
     local tags = element.tags --[[@as { mode: action, action: string }?]]
-    if not element.get_mod() == "inventory-selector" or not tags then return end
+    if element.get_mod() ~= "inventory-selector" or not tags then return end
     local player = game.get_player(event.player_index) --[[@as LuaPlayer]]
     if not player or not player.valid then return end
     local entity = player.opened --[[@as LuaEntity]]
@@ -263,7 +263,7 @@ end
 local function on_gui_elem_changed(event)
     local element = event.element
     local tags = element.tags --[[@as { mode: action }?]]
-    if not element.get_mod() == "inventory-selector" or not tags then return end
+    if element.get_mod() ~= "inventory-selector" or not tags then return end
     local player = game.get_player(event.player_index) --[[@as LuaPlayer]]
     if not player or not player.valid then return end
     local entity = player.opened --[[@as LuaEntity]]
