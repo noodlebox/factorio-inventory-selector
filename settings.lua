@@ -25,7 +25,6 @@ data:extend{{
     default_value = "allow-unsafe",
     allowed_values = {
         "always-immediate", -- Deadlock mitigation disabled, but always change inventory settings immediately. May cause inserters to become stuck during automated control, requiring player intervention to resolve.
-        --"allow-safe", -- Only defer risky changes if explicitly requested by a caller, otherwise apply immediately.
         "allow-unsafe", -- Defer risky changes to inventory settings until safe, but allow callers to override this behavior to change a setting immediately. This is the default behavior.
         "always-safe", -- Always defer changes if risky, even if the caller indicates otherwise. May delay requested settings indefinitely when an inserter is waiting for space in its drop target.
     },

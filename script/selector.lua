@@ -1,7 +1,7 @@
 local inventory = require("script.inventory")
 local limbo = require("script.limbo")
 
-local DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-safe" | "allow-unsafe" | "always-safe"]]
+local DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-unsafe" | "always-safe"]]
 local ENABLE_CIRCUIT = settings.global["inventory-selector-enable-circuit"].value --[[@as boolean]]
 local PENDING_RETRY_TICKS = settings.global["inventory-selector-pending-retry-ticks"].value --[[@as integer]]
 local FLOATING_RETRY_TICKS = settings.global["inventory-selector-floating-retry-ticks"].value --[[@as integer]]
@@ -380,7 +380,9 @@ end
 ---@param please? any # Ensure a non-nil result or die trying.
 ---@return selector?
 local function get_data(entity, mode, please)
-    if not supports_mode(entity, mode) then
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
         error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
     end
     -- unit_number is non-nil for all the entities supported by this mod
@@ -400,13 +402,149 @@ end
 ---@param mode action
 ---@param inventory_type? inventory_type
 ---@return boolean
-local function can_safely_set(entity, mode, inventory_type)
-    local data = get_data(entity, mode)
-    local prev_inventory_type = data and data.actual_inventory_type
+local function _can_safely_set(entity, mode, inventory_type)
+    -- Risk only exists for the drop action of inserters when an item is being held
+    if mode ~= "drop" or entity.type ~= "inserter" or not entity.held_stack.valid_for_read then return true end
+    local data = storage.selectors[entity.unit_number]
     -- If no need to set anything, no risk of deadlock
+    return (data and data.actual_inventory_type) == inventory_type
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@return inventory_type?
+local function _get_unsafe(entity, mode)
+    local id = entity.unit_number --[[@as id]]
+    if mode == "pickup" then id = -id end
+    local data = storage.selectors[id]
+    return data and data.actual_inventory_type
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@return inventory_type?
+local function _get_safe(entity, mode)
+    if mode == "drop" then
+        local pending = storage.pending[entity.unit_number --[[@as id]]]
+        if pending then
+            if pending == "clear" then return nil end
+            return pending --[[@as inventory_type]]
+        end
+    end
+    return _get_unsafe(entity, mode)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param immediate? boolean # Reveal the truth to those that can handle it.
+---@return inventory_type?
+local function _get_allow_unsafe(entity, mode, immediate)
+    if immediate then
+        return _get_unsafe(entity, mode)
+    end
+    return _get_safe(entity, mode)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return true
+local function _set_unsafe(entity, mode, inventory_type)
+    local id = entity.unit_number --[[@as id]]
+    if mode == "pickup" then
+        id = -id
+    else
+        -- Clear any pending changes to the drop inventory
+        storage.pending[id] = nil
+    end
+    local data = storage.selectors[id]
+    if not inventory_type then
+        if data then data:destroy() end
+        return true
+    end
+
+    if not data then
+        -- Create a new selector
+        storage.selectors[id] = selector{
+            id=id,
+            entity=entity,
+            mode=mode,
+            inventory_type=inventory_type,
+            actual_inventory_type=inventory_type,
+        }
+        return true
+    end
+
+    if data.inventory_type ~= "circuit" then
+        data.inventory_type = inventory_type
+    end
+
+    local prev_inventory_type = data.actual_inventory_type
     if inventory_type == prev_inventory_type then return true end
 
-    return mode ~= "drop" or entity.type ~= "inserter" or not entity.held_stack.valid_for_read
+    data.actual_inventory_type = inventory_type
+    if prev_inventory_type == "none" then
+        -- If previously "none", then our target may be stale
+        data:update_proxy_target()
+    else
+        -- Otherwise, skip the more expensive target check and just remap the proxy inventory
+        data:update_proxy_inventory()
+    end
+
+    return true
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return boolean # true if the desired setting has been successfully applied (not deferred)
+local function _set_safe(entity, mode, inventory_type)
+    if not _can_safely_set(entity, mode, inventory_type) then
+        storage.pending[entity.unit_number --[[@as id]]] = inventory_type or "clear" -- An intended change to nil is represented with a value of "clear"
+        return false -- Signal a deferred change
+    end
+    return _set_unsafe(entity, mode, inventory_type)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@param immediate? boolean # Throw caution to the wind. Deadlocks build character.
+---@return boolean # true if the desired setting has been successfully applied (not deferred)
+local function _set_allow_unsafe(entity, mode, inventory_type, immediate)
+    if immediate then
+        return _set_unsafe(entity, mode, inventory_type)
+    end
+    return _set_safe(entity, mode, inventory_type)
+end
+
+local _get, _set = _get_allow_unsafe, _set_allow_unsafe
+
+---@param deadlock_safety "always-immediate" | "allow-unsafe" | "always-safe"
+local function rebind_get_set(deadlock_safety)
+    if deadlock_safety == "always-immediate" then
+        _get, _set = _get_unsafe, _set_unsafe
+    elseif deadlock_safety == "always-safe" then
+        _get, _set = _get_safe, _set_safe
+    else
+        _get, _set = _get_allow_unsafe, _set_allow_unsafe
+    end
+end
+rebind_get_set(DEADLOCK_SAFETY)
+
+-- Return true if a call to set() right now with the same parameters would either be deferred or risk deadlocking.
+-- Should never raise an error unless given entity is nil or not valid.
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return boolean
+local function can_safely_set(entity, mode, inventory_type)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    end
+    return _can_safely_set(entity, mode, inventory_type)
 end
 
 -- Get currently assigned inventory type. Specifically, this returns the currently desired inventory assignment, even if it has
@@ -417,22 +555,12 @@ end
 ---@param immediate? boolean # Reveal the truth to those that can handle it.
 ---@return inventory_type?
 local function get(entity, mode, immediate)
-    if DEADLOCK_SAFETY == "always-immediate" then
-        immediate = true
-    elseif DEADLOCK_SAFETY == "always-safe" then
-        immediate = false
-    elseif immediate == nil then -- "allow-unsafe" or "allow-safe"
-        immediate = DEADLOCK_SAFETY ~= "allow-unsafe"
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
     end
-
-    local data = get_data(entity, mode)
-    if not data then return nil end
-
-    if immediate then return data.actual_inventory_type end
-    local pending = storage.pending[data.id]
-    if not pending then return data.actual_inventory_type end
-    if pending == "clear" then return nil end
-    return pending --[[@as inventory_type]]
+    return _get(entity, mode, immediate)
 end
 
 -- Assign a new inventory type to a selector (or restore its default behavior if nil).
@@ -451,51 +579,12 @@ end
 ---@param immediate? boolean # Throw caution to the wind. Deadlocks build character.
 ---@return boolean # true if the desired setting has been successfully applied (not deferred)
 local function set(entity, mode, inventory_type, immediate)
-    if DEADLOCK_SAFETY == "always-immediate" then
-        immediate = true
-    elseif DEADLOCK_SAFETY == "always-safe" then
-        immediate = false
-    elseif immediate == nil then -- "allow-unsafe" or "allow-safe"
-        immediate = DEADLOCK_SAFETY ~= "allow-unsafe"
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
     end
-
-    local data = get_data(entity, mode, "please") --[[@as selector]] -- This won't be nil because we were polite
-    local id = data.id
-
-    if data.inventory_type ~= "circuit" then
-        data.inventory_type = inventory_type
-    end
-
-    -- Check whether the selector is already configured as intended
-    local prev_inventory_type = data.actual_inventory_type
-    if inventory_type == prev_inventory_type then
-        -- Clear pending changes, as there is definitely no need to wait for our intended setting
-        storage.pending[id] = nil
-        if not inventory_type and not data.inventory_type then
-            data:destroy()
-        end
-        return true
-    end
-
-    if not immediate and not can_safely_set(entity, mode, inventory_type) then
-        -- Mitigate a potential deadlock here
-        storage.pending[id] = inventory_type or "clear" -- An intended change to nil is represented with a value of "clear"
-        return false -- Signal a deferred change
-    else
-        storage.pending[id] = nil -- Clear out any pending changes that remain
-    end
-
-    if not inventory_type and not data.inventory_type then
-        data:destroy()
-    elseif data.actual_inventory_type == "none" then
-        data.actual_inventory_type = inventory_type
-        data:update_proxy_target()
-    else
-        data.actual_inventory_type = inventory_type
-        data:update_proxy_inventory()
-    end
-
-    return true
+    return _set(entity, mode, inventory_type, immediate)
 end
 
 ---@param entity LuaEntity
@@ -905,6 +994,7 @@ local library = {
 
             if event.setting == "inventory-selector-deadlock-safety" then
                 DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-unsafe" | "always-safe"]]
+                rebind_get_set(DEADLOCK_SAFETY)
             elseif event.setting == "inventory-selector-enable-circuit" then
                 ENABLE_CIRCUIT = settings.global["inventory-selector-enable-circuit"].value --[[@as boolean]]
             elseif event.setting == "inventory-selector-pending-retry-ticks" then
