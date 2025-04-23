@@ -750,6 +750,15 @@ local function on_post_entity_died(event)
     return notify(event.unit_number)
 end
 
+---@param event EventData.on_player_mined_entity | EventData.on_robot_mined_entity | EventData.on_space_platform_mined_entity
+local function on_mined_entity(event)
+    local entity = event.entity
+    local tag = entity and entity.valid and to_tag(entity)
+    if not tag then return end
+    if not storage.replacing then storage.replacing = {} end
+    storage.replacing[entity.gps_tag] = { tag = tag, tick = event.tick }
+end
+
 ---@param event EventData.on_player_setup_blueprint
 local function on_player_setup_blueprint(event)
     local record = event.record or event.stack
@@ -758,18 +767,25 @@ local function on_player_setup_blueprint(event)
     for _, bpe in ipairs(record.get_blueprint_entities() or {}) do
         local id = bpe.entity_number
         local entity = mapping[id]
-        local tags = entity and entity.valid and to_tag(entity)
-        if tags then
-            record.set_blueprint_entity_tag(id, "inventory-selector", tags)
+        local tag = entity and entity.valid and to_tag(entity)
+        if tag then
+            record.set_blueprint_entity_tag(id, "inventory-selector", tag)
         end
     end
 end
 
 ---@param event EventData.on_built_entity | EventData.on_robot_built_entity | EventData.on_space_platform_built_entity | EventData.script_raised_revive
 local function on_built_entity(event)
-    local entity, tags = event.entity, event.tags
-    if not entity or not entity.valid or not tags then return end
-    return from_tag(entity, tags["inventory-selector"]--[[@as selector_tag?]])
+    local entity = event.entity
+    if not entity or not entity.valid then return end
+    local tag = event.tags and event.tags["inventory-selector"] --[[@as selector_tag?]]
+    if not tag then
+        -- No event tags, maybe fast replace?
+        local replace = storage.replacing and storage.replacing[entity.gps_tag]
+        if replace and replace.tick == event.tick then tag = replace.tag end
+    end
+    if not tag then return end
+    return from_tag(entity, tag)
 end
 
 local function tick_pending()
@@ -795,6 +811,7 @@ local function tick_floating()
             data:update_proxy_target()
         end
     end
+    storage.replacing = {}
 end
 
 local function tick_circuit()
@@ -958,6 +975,10 @@ local library = {
         ---@type table<id, inventory_type | "clear">
         storage.pending = {}
 
+        -- Maps GPS tags to selector tags and event tick to use when upgrading or fast replacing entities.
+        ---@type table<string, { tag: selector_tag, tick: MapTick }>
+        storage.replacing = {}
+
         -- Maps unit numbers (or useful_ids in general) of entities to the set of selectors that would care if that entity went
         -- away. We generally don't expect selectors to remove their entries here if they become no longer relevant, as that could
         -- lead to messy edge cases such as when a selector depends on the same entity for multiple reasons and only one of those
@@ -995,6 +1016,9 @@ local library = {
         [defines.events.on_entity_cloned] = on_entity_settings_pasted,
         [defines.events.on_entity_settings_pasted] = on_entity_settings_pasted,
         [defines.events.on_post_entity_died] = on_post_entity_died,
+        [defines.events.on_player_mined_entity] = on_mined_entity,
+        [defines.events.on_robot_mined_entity] = on_mined_entity,
+        [defines.events.on_space_platform_mined_entity] = on_mined_entity,
         [defines.events.on_built_entity] = on_built_entity,
         [defines.events.on_robot_built_entity] = on_built_entity,
         [defines.events.on_space_platform_built_entity] = on_built_entity,
