@@ -653,7 +653,8 @@ local function to_tag(entity)
         if not entity or not entity.valid then return end
         tag = entity.tags and entity.tags["inventory-selector"] --[[@as selector_tag?]]
         if tag then return tag end
-        id = entity.unit_number --[[@as id]]
+        id = entity.unit_number
+        if not id then return end
     end
     tag = {}
     local drop = storage.selectors[id] --[[@as selector?]]
