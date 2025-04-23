@@ -230,7 +230,11 @@ local function on_gui_opened(event)
     if event.gui_type == defines.gui_type.entity then
         local parent = player.gui.relative
         local entity = event.entity
-        local gui = relative_gui_for_entity_type[entity and entity.valid and entity.type]
+        if not entity or not entity.valid then return destroy_on(parent) end
+
+        local entity_type = entity.type
+        if entity_type == "entity-ghost" then entity_type = entity.ghost_type end
+        local gui = relative_gui_for_entity_type[entity_type]
         if not gui then return destroy_on(parent) end
         return render_on(parent, { gui = gui, position = defines.relative_gui_position.right })
     elseif event.gui_type == defines.gui_type.custom then
@@ -256,7 +260,12 @@ local function on_gui_checked_state_changed(event)
     elseif tags.action == "circuit_set" then
         selector.set_circuit_mode(entity, tags.mode, event.element.state)
     end
-    return render_on(player.gui.relative, { gui = relative_gui_for_entity_type[entity.type], position = defines.relative_gui_position.right })
+
+    local entity_type = entity.type
+    if entity_type == "entity-ghost" then entity_type = entity.ghost_type end
+    local gui = relative_gui_for_entity_type[entity_type]
+
+    return render_on(player.gui.relative, { gui = gui, position = defines.relative_gui_position.right })
 end
 
 ---@param event EventData.on_gui_elem_changed
@@ -274,7 +283,12 @@ local function on_gui_elem_changed(event)
     local name = select(3, string.find(elem or "", "^inventory%-selector%-inventory%-([_%a]+)$")) or "none"
 
     selector.set(entity, tags.mode, name, true)
-    return render_on(player.gui.relative, { gui = relative_gui_for_entity_type[entity.type], position = defines.relative_gui_position.right })
+
+    local entity_type = entity.type
+    if entity_type == "entity-ghost" then entity_type = entity.ghost_type end
+    local gui = relative_gui_for_entity_type[entity_type]
+
+    return render_on(player.gui.relative, { gui = gui, position = defines.relative_gui_position.right })
 end
 
 -- TODO: Need to watch for externally triggered changes to the entity shown in the open GUI
@@ -298,9 +312,12 @@ return {
             end
             for _, player in pairs(game.players) do
                 if player.valid and player.opened_gui_type == defines.gui_type.entity then
-                    local anchor_gui = relative_gui_for_entity_type[player.opened.type]
-                    if anchor_gui then
-                        render_on(player.gui.relative, { gui = anchor_gui, position = defines.relative_gui_position.right })
+                    local entity = player.opened --[[@as LuaEntity]]
+                    local entity_type = entity and entity.valid and entity.type
+                    if entity_type == "entity-ghost" then entity_type = entity.ghost_type end
+                    local gui = relative_gui_for_entity_type[entity_type]
+                    if gui then
+                        render_on(player.gui.relative, { gui = gui, position = defines.relative_gui_position.right })
                     end
                 end
             end

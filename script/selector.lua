@@ -366,7 +366,7 @@ end
 local function supports_mode(entity, mode)
     if not entity or not entity.valid then return false end
     -- Only Inserter entities support reading the pickup_position property. Any others will raise an error rather than returning nil.
-    if mode == "pickup" then return entity.type == "inserter" end
+    if mode == "pickup" then return entity.type == "inserter" or entity.type == "entity-ghost" and entity.ghost_type == "inserter" end
     -- A much wider variety of entity types support a drop target, some of optionally. These include inserters, mining drills, and any
     -- crafting machine subtype. Whether supported or not by an entity's base class, reading drop_position will safely return nil if
     -- not supported by the entity.
@@ -559,6 +559,10 @@ local function get(entity, mode, immediate)
         error("Entity is nil or invalid: " .. serpent.line(entity))
     elseif not supports_mode(entity, mode) then
         error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tag = ((entity.tags or {})["inventory-selector"] --[[@as selector_tag?]] or {})[mode]
+        if tag == "circuit" then return "none" end
+        return tag --[[@as inventory_type?]]
     end
     return _get(entity, mode, immediate)
 end
@@ -583,6 +587,12 @@ local function set(entity, mode, inventory_type, immediate)
         error("Entity is nil or invalid: " .. serpent.line(entity))
     elseif not supports_mode(entity, mode) then
         error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tags["inventory-selector"] or {}
+        tags["inventory-selector"][mode] = inventory_type
+        entity.tags = tags
+        return true
     end
     return _set(entity, mode, inventory_type, immediate)
 end
@@ -591,6 +601,13 @@ end
 ---@param mode action
 ---@return boolean
 local function get_circuit_mode(entity, mode)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        return ((entity.tags or {})["inventory-selector"] --[[@as selector_tag?]] or {})[mode] == "circuit"
+    end
     local data = get_data(entity, mode)
     return data and data.inventory_type == "circuit" or false
 end
@@ -601,6 +618,17 @@ end
 ---@param enable? boolean # Defaults to true
 ---@return nil
 local function set_circuit_mode(entity, mode, enable)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tags["inventory-selector"] or {}
+        tags["inventory-selector"][mode] = enable and "circuit" or "none"
+        entity.tags = tags
+        return
+    end
     if enable == nil then enable = true end
     local data = get_data(entity, mode, "please") --[[@as selector]]
     if enable == (data.inventory_type == "circuit") then return end
@@ -611,6 +639,58 @@ local function set_circuit_mode(entity, mode, enable)
     else
         storage.circuit[id] = nil
         data.inventory_type = get(entity, mode)
+    end
+end
+
+---@alias selector_tag table<action, inventory_type | "circuit">
+
+---@param entity id | LuaEntity?
+---@return selector_tag?
+local function to_tag(entity)
+    local id = entity
+    local tag
+    if type(entity) ~= "number" then
+        if not entity or not entity.valid then return end
+        tag = entity.tags and entity.tags["inventory-selector"] --[[@as selector_tag?]]
+        if tag then return tag end
+        id = entity.unit_number --[[@as id]]
+    end
+    tag = {}
+    local drop = storage.selectors[id] --[[@as selector?]]
+    if drop then tag.drop = drop.inventory_type end
+    local pickup = storage.selectors[-id] --[[@as selector?]]
+    if pickup then tag.pickup = pickup.inventory_type end
+    if drop or pickup then return tag end
+end
+
+---@param entity LuaEntity?
+---@param tag selector_tag?
+---@return nil
+local function from_tag(entity, tag)
+    if not entity or not entity.valid then return end
+    if entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tag
+        entity.tags = tags
+        return
+    end
+
+    local prev_tag = to_tag(entity)
+    local prev_drop = prev_tag and prev_tag.drop
+    local drop = tag and tag.drop
+    if supports_mode(entity, "drop") and prev_drop ~= drop then
+        set_circuit_mode(entity, "drop", drop == "circuit")
+        if drop ~= "circuit" then
+            _set(entity, "drop", drop --[[@as inventory_type?]], true)
+        end
+    end
+    local prev_pickup = prev_tag and prev_tag.pickup
+    local pickup = tag and tag.pickup
+    if supports_mode(entity, "pickup") and prev_pickup ~= pickup then
+        set_circuit_mode(entity, "pickup", pickup == "circuit")
+        if pickup ~= "circuit" then
+            _set(entity, "pickup", pickup --[[@as inventory_type?]], true)
+        end
     end
 end
 
@@ -636,50 +716,10 @@ end
 
 local notify = registry.lose
 
----@alias selector_tags table<action, inventory_type | "circuit">
-
----@param entity id | LuaEntity
----@return selector_tags?
-local function as_tags(entity)
-    if entity and type(entity) ~= "number" then entity = entity.unit_number end
-    if not entity then return end
-    local drop = storage.selectors[entity] --[[@as selector?]]
-    local pickup = storage.selectors[-entity] --[[@as selector?]]
-    if not drop and not pickup then return nil end
-    return {
-        drop = drop and drop.inventory_type,
-        pickup = pickup and pickup.inventory_type,
-    }
-end
-
----@param entity LuaEntity
----@param tags? selector_tags
-local function from_tags(entity, tags)
-    if not entity or not entity.valid then return end
-    if supports_mode(entity, "drop") then
-        local drop = tags and tags.drop
-        if drop == "circuit" then
-            set_circuit_mode(entity, "drop", true)
-        else
-            set_circuit_mode(entity, "drop", false)
-            set(entity, "drop", drop --[[@as inventory_type?]], true)
-        end
-    end
-    if supports_mode(entity, "pickup") then
-        local pickup = tags and tags.pickup
-        if pickup == "circuit" then
-            set_circuit_mode(entity, "pickup", true)
-        else
-            set_circuit_mode(entity, "pickup", false)
-            set(entity, "pickup", pickup --[[@as inventory_type?]], true)
-        end
-    end
-end
-
 ---@param from LuaEntity
 ---@param to LuaEntity
 local function copy_settings(from, to)
-    return from_tags(to, as_tags(from))
+    return from_tag(to, to_tag(from))
 end
 
 local function on_object_destroyed(event)
@@ -704,7 +744,7 @@ local function on_post_entity_died(event)
     local ghost = event.ghost --[[@as LuaEntity?]]
     if ghost and ghost.valid then
         local tags = ghost.tags or {}
-        tags["inventory-selector"] = as_tags(ghost.ghost_unit_number)
+        tags["inventory-selector"] = to_tag(ghost.ghost_unit_number)
         ghost.tags = tags
     end
     return notify(event.unit_number)
@@ -718,7 +758,7 @@ local function on_player_setup_blueprint(event)
     for _, bpe in ipairs(record.get_blueprint_entities() or {}) do
         local id = bpe.entity_number
         local entity = mapping[id]
-        local tags = entity and entity.valid and as_tags(entity)
+        local tags = entity and entity.valid and to_tag(entity)
         if tags then
             record.set_blueprint_entity_tag(id, "inventory-selector", tags)
         end
@@ -729,7 +769,7 @@ end
 local function on_built_entity(event)
     local entity, tags = event.entity, event.tags
     if not entity or not entity.valid or not tags then return end
-    return from_tags(entity, tags["inventory-selector"]--[[@as selector_tags?]])
+    return from_tag(entity, tags["inventory-selector"]--[[@as selector_tag?]])
 end
 
 local function tick_pending()
