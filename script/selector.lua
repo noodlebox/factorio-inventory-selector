@@ -1,13 +1,17 @@
 local inventory = require("script.inventory")
 local limbo = require("script.limbo")
 
-local DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-safe" | "allow-unsafe" | "always-safe"]]
+local DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-unsafe" | "always-safe"]]
 local ENABLE_CIRCUIT = settings.global["inventory-selector-enable-circuit"].value --[[@as boolean]]
 local PENDING_RETRY_TICKS = settings.global["inventory-selector-pending-retry-ticks"].value --[[@as integer]]
 local FLOATING_RETRY_TICKS = settings.global["inventory-selector-floating-retry-ticks"].value --[[@as integer]]
 local UPDATE_CIRCUIT_TICKS = settings.global["inventory-selector-update-circuit-ticks"].value --[[@as integer]]
 local DEBUG = settings.global["inventory-selector-enable-debug"].value --[[@as boolean]]
 
+-- A unique identifier for selectors. Derived from `LuaEntity::unit_number`, which the docs say is a uint64. This mod uses
+-- `unit_number` to represent selectors for the drop action of an entity and `-unit_number` for the pickup action. Technically,
+-- this means "collisions" are possible: either an inserter has a `unit_number` of `0` (it won't) or an entity has a `unit_number`
+-- larger than `2^63` (at which point, far more will have already been broken by numeric precision limitations of Lua).
 ---@alias id integer
 ---@alias action "drop" | "pickup"
 
@@ -41,6 +45,17 @@ local function write_target(entity, mode, new_target)
     end
 end
 
+-- Test whether two `LuaEntity` instances refer to the same entity (by `unit_number`).
+-- Returns false if either is nil, invalid, or does not have a unit_number.
+---@param a LuaEntity?
+---@param b LuaEntity?
+---@return boolean
+local function is_same(a, b)
+    if not a or not b or not a.valid or not b.valid then return false end
+    local ai, bi = a.unit_number, b.unit_number
+    return ai and ai == bi or false
+end
+
 ---@param position MapPosition
 ---@return BoundingBox
 local function get_tile(position)
@@ -59,28 +74,26 @@ local function is_inside(position, region)
     return position.x >= a0.x and position.x <= a1.x and position.y >= a0.y and position.y <= a1.y
 end
 
--- Keep track of important entity relationships so their loss can be handled gracefully.
-local registry = {}
-
--- Dispatch notifications for the loss of an entity
----@param victim id
-registry.lose = function (victim)
-    local mourners = storage.mourners[victim]
-    storage.mourners[victim] = nil
-    if not mourners then return end
-
-    if not registry.mourn then return end
-    for mourner in pairs(mourners) do
-        registry.mourn(mourner, victim)
-    end
-end
+-------------------------------------------------------------------------------
+-- Entity relationship tracking
+-------------------------------------------------------------------------------
 
 ---@param id id
----@param target LuaEntity
-registry.remember = function (id, target)
-    if not target or not target.valid then return end
-    local _, target_id = script.register_on_object_destroyed(target)
-    --local target_id = target.unit_number --[[@as id]]
+---@param target LuaEntity # This should be an entity with a valid unit_number
+local function remember(id, target)
+    if not target or not target.valid then
+        if not DEBUG then return end
+        error(string.format("Selector %q is trying to track an invalid entity: %s", id, serpent.line(target)))
+    end
+    -- Events other than on_object_destroyed may also interact with this system, so unit_number is preferable to registration number
+    local target_id = target.unit_number
+    -- If an entity cannot be identified by unit_number, it shouldn't be tracked here. This should not happen in general.
+    if not target_id then
+        if not DEBUG then return end
+        error(string.format("Selector %q is trying to track an entity without a unit_number: %s", id, serpent.line(target)))
+    end
+    script.register_on_object_destroyed(target)
+
     local mourners = storage.mourners[target_id]
     if not mourners then
         storage.mourners[target_id] = { [id] = true }
@@ -89,6 +102,68 @@ registry.remember = function (id, target)
     end
 end
 
+-- Handle unexpected loss of an entity
+-- This will be triggered by on_object_destroyed, notifying any selectors that may depend on an entity. If a selector no longer depends on the entity, it simply ignores it.
+-- This is also called when "victim" is modified in some way that may render a selector invalid for some reason.
+-- Handling one of these events will fall into one of these four categories, in order of increasing severity:
+-- - No action required (e.g. victim was a stale reference to an old target)
+-- - The targeted inventory should be re-evaluated (e.g. the target is a proxy container whose own target may have changed)
+-- - The target itself may have changed (e.g. either the mourner or its target have moved)
+-- - The selector should be destroyed (e.g. the mourner itself is no longer valid)
+-- Any of these should behave in an idempotent manner, allowing for straightforward handling of events immediately as they come in,
+-- though possibly with some redundant work.
+--
+-- A smarter implementation might batch these actions together, applying only the most severe resolution necessary (as each also
+-- ensures that any "lesser" issues would be resolved if present). The tricky part of this approach would be ensuring that batched
+-- actions were still performed on same tick, as there is no guarantee of event order relative to `on_tick`.
+---@param mourner id # Selector's id
+---@param victim id # Generally this should be a valid unit_number
+local function mourn(mourner, victim)
+    local data = storage.selectors[mourner]
+
+    -- If the mourner is already gone, then there's nothing to do.
+    if not data then return end
+
+    -- Regardless of the victim's relationship to the mourner, validate its entity references.
+
+    -- If the mourner's entity is no longer valid, it should be cleaned up.
+    if not data.entity or not data.entity.valid then return data:destroy() end
+    -- If the mourner's target is no longer valid, it should attempt to find a new one.
+    if data.target and not data.target.valid then return data:update_proxy_target() end
+
+    -- Determine the relationship to the mourner
+    if victim == mourner or victim == -mourner or victim == data.target_id then
+        -- A change to the mourner itself or its direct target requires checking that the target is still within reach.
+        return data:update_proxy_target()
+    elseif victim == data.chained_id then
+        -- A change to the mourner's indirect (chained) target requires simply updating the proxy configuration.
+        return data:update_proxy_inventory()
+    end
+    -- No longer relevant, so just ignore it
+end
+
+-- Dispatch notifications for the loss of an entity
+---@param victim id
+local function notify(victim)
+    -- Technically, victim could be anything. It's exposed to the external API to allow other mods to attempt to work
+    -- cooperatively, but in general this should be a unit_number. It is possible for unit_number to be nil for certain
+    -- entities, but none of those should matter to this mod.
+    if not victim then return end
+
+    local mourners = storage.mourners[victim]
+    storage.mourners[victim] = nil
+    if not mourners then return end
+
+    for mourner in pairs(mourners) do
+        mourn(mourner, victim)
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Selector state
+-------------------------------------------------------------------------------
+
+-- A selector contains the configuration data for one interaction mode of a single entity. Inserters may have up to two of these.
 ---@class selector
 -- A constant unique key among selectors, the index used as the key for various dictionaries tracking their state.
 -- It is derived from the unit number of the entity it controls and its mode of action:
@@ -104,6 +179,7 @@ end
 -- The configured inventory restriction, if any. Uses a "unified" inventory type name, which may map to distinct inventory indices across different entity types.
 -- This is the only meaningful way to refer to a selected inventory across this mod's API.
 -- Some special values are possible:
+--
 -- - "circuit" indicates that this selector's configuration should be determined by the connected circuit network. Behaves as "none" if no circuit network is connected.
 -- - nil indicates that the entity should use its built-in default behavior if possible, as if this selector did not exist.
 ---@field inventory_type? inventory_type | "circuit"
@@ -111,6 +187,12 @@ end
 ---@field actual_inventory_type? inventory_type
 -- An instance of the hidden proxy entity, through which all interaction between `entity` and `target` is mediated.
 -- This only supports interaction through this mod's provided APIs. Any external interaction otherwise may cause undefined behavior.
+-- Most of this mod blindly assumes that proxies are always valid, with the expectation that errors will be raised if this is not the case.
+-- They should never by externally teleported, cloned, or blueprinted. This mod will create and destroy them as needed.
+--
+-- NOTE: It is not always possible (starting in 2.0.44) to prevent entities from automatically selecting a proxy as their pickup target and this may lead to unexpected behavior.
+--       Protecting them against unintended use as drop targets is possible, but this depends on functionality that is considered a "bug", so may break in the future.
+--       Hopefully, official support for this functionality will be provided in the future. (See: https://forums.factorio.com/viewtopic.php?t=128082)
 ---@field proxy LuaEntity
 -- The "apparent" target of this entity, which would be assumed to be the true target of interaction for this entity. When this selector is active, all interaction with this target is managed through the proxy entity.
 -- A direct reference to this entity is maintained to allow for convenient assignment to the proxy entity as needed, as well as shared through the APIs to permit other mods to read a entity's apparent target, even when this connection is simulated by mediated interaction with the proxy here.
@@ -129,8 +211,11 @@ local selector = {}
 selector = setmetatable(selector, { __call = function (cls, obj) return setmetatable(obj or {}, cls):init() end })
 selector.__index = selector
 
+-- Register the metatable because selectors end up in `storage`
 script.register_metatable("inventory-selector", selector)
 
+-- At time of creation, selectors should have at least a valid id, entity, and mode
+-- Its target will be detected if present, and if there is an actual_inventory_type, it will be connected
 ---@return selector
 function selector:init()
     local entity = self.entity
@@ -166,7 +251,7 @@ function selector:destroy()
     -- Restore direct connection to the target entity, if appropriate
     if self.entity then
         if self.entity.valid then
-            self:connect_proxy(false)
+            self:disconnect_proxy()
         end
         self.entity = nil
     end
@@ -178,47 +263,41 @@ function selector:destroy()
     if proxy and proxy.valid then proxy.destroy() end
 end
 
--- Connect an entity with its proxy or bypass it to connect with its target.
--- If DEBUG is enabled, this will not attempt to reassign the target if assumed not necessary.
--- It will confirm whether the connection ends in the intended state in either case, raising an error if not.
----@param state? boolean # Defaults to true, which will connect the entity to its proxy. If false, disconnects the entity from its proxy (and connects it to its target directly).
----@param expect? boolean # If given, checks assumptions for debugging, to potentially expose faults in implementation that could otherwise go unnoticed in most normal use.
+-- Connect an entity with its proxy (whether newly set up or possibly "detached" by entity movement).
 ---@return selector
-function selector:connect_proxy(state, expect)
-    if state == nil then state = true end
-    if not DEBUG then expect = nil end
+function selector:connect_proxy()
+    local entity, mode, proxy = self.entity, self.mode, self.proxy
 
-    local entity = self.entity
-    local mode = self.mode
-    local proxy = self.proxy
-    local target = self.target
-
-    local pre_target, position = read_target(entity, mode)
-    ---@type boolean|nil
-    local pre_state = pre_target == proxy
-    if not pre_state and pre_target ~= target then pre_state = nil end
-
-    if expect == state and state ~= pre_state then
-        error("Entity and proxy unexpectedly " .. (pre_state and "" or "dis") .. "connected: " .. serpent.line(self))
-    end
-
+    -- Handle change in force of the entity (to ensure it can still attach to the proxy)
+    -- FIXME: This should be necessary almost never, and might be better handled by extending the remember/notify system to handle
+    --        objects other than entities (like forces and surfaces).
     proxy.force = entity.force
-    proxy.teleport(position)
-    if state then
+
+    local raw_target, position = read_target(entity, mode)
+    if not is_same(raw_target, proxy) then
+        proxy.teleport(position) -- TODO: Measure performance impact of doing this unconditionally vs comparing position first
         write_target(entity, mode, proxy)
-    else
-        write_target(entity, mode, target)
     end
 
-    if expect == nil then return self end
+    return self
+end
 
-    local post_target = read_target(entity, mode)
-    ---@type boolean|nil
-    local post_state = post_target == proxy
-    if not post_state and post_target ~= target then post_state = nil end
+-- Disconnect an entity from its proxy and attempt to connect directly to its "apparent" target, if any.
+-- This doesn't *need* to end up with the same target, as this mod's idea of a "valid" target does not overlap perfectly with that
+-- of the base game, but it definitely shouldn't be connected to the proxy anymore.
+--
+-- FIXME: We *should* try to confirm this entity does not end up automatically connected to this (or any other) proxy after this.
+--        Unfortunately, we can't know which target will be selected automatically until a later tick, so we should schedule a
+--        check to catch any odd edge cases that pop up. These *should* be rare though, as there should almost always be a valid
+--        target present wherever a proxy exists, with "floating" selectors being the main exception (and there aren't any great
+--        solutions to that with reasonable performance).
+---@return selector
+function selector:disconnect_proxy()
+    local entity, mode, proxy, target = self.entity, self.mode, self.proxy, self.target
 
-    if state ~= post_state then
-        error("Entity failed to " .. (state and "" or "dis") .. "connect with proxy: " .. serpent.line(self))
+    local raw_target = read_target(entity, mode)
+    if is_same(raw_target, proxy) then
+        write_target(entity, mode, target)
     end
 
     return self
@@ -231,7 +310,13 @@ end
 ---@return selector
 function selector:update_proxy_inventory()
     local target = self.target
-    if target and not target.valid then return self:update_proxy_target() end
+    if target and not target.valid then
+        -- FIXME: This is possible during large batches of events raised in an inconvenient order (where a less-important entity is handled first).
+        --        That logic should be improved by batching handling of mass events, which may also improve performance, so long as edge cases are handled.
+        --if not DEBUG then return self:update_proxy_target() end
+        --error(string.format("Selector %q has an invalid target: %s", self.id, serpent.line(target)))
+        return self:update_proxy_target()
+    end
     local index = nil
     local inventory_type = self.actual_inventory_type
     local proxy = self.proxy
@@ -254,7 +339,7 @@ function selector:update_proxy_inventory()
         index = chained_index
 
         -- Track the secondary target as well
-        registry.remember(self.id, chained)
+        remember(self.id, chained)
         self.chained_id = chained.unit_number--[[@as id]]
     end
 
@@ -272,7 +357,11 @@ function selector:update_proxy_inventory()
     proxy.proxy_target_entity = target
     proxy.proxy_target_inventory = index
 
-    self:connect_proxy(inventory_type ~= nil)
+    if inventory_type then
+        self:connect_proxy()
+    else
+        self:disconnect_proxy()
+    end
 
     -- Force entity to wake up if sleeping
     self.entity.active = false
@@ -293,7 +382,7 @@ function selector:update_proxy_target(target)
     local entity = self.entity
     local mode = self.mode
 
-    registry.remember(id, entity)
+    remember(id, entity)
 
     target = target or self.target
 
@@ -350,7 +439,7 @@ function selector:update_proxy_target(target)
 
     self.target = target
     self.target_id = target and target.unit_number
-    if target then registry.remember(id, target) end
+    if target then remember(id, target) end
 
     return self:update_proxy_inventory()
 end
@@ -366,7 +455,7 @@ end
 local function supports_mode(entity, mode)
     if not entity or not entity.valid then return false end
     -- Only Inserter entities support reading the pickup_position property. Any others will raise an error rather than returning nil.
-    if mode == "pickup" then return entity.type == "inserter" end
+    if mode == "pickup" then return entity.type == "inserter" or entity.type == "entity-ghost" and entity.ghost_type == "inserter" end
     -- A much wider variety of entity types support a drop target, some of optionally. These include inserters, mining drills, and any
     -- crafting machine subtype. Whether supported or not by an entity's base class, reading drop_position will safely return nil if
     -- not supported by the entity.
@@ -380,7 +469,9 @@ end
 ---@param please? any # Ensure a non-nil result or die trying.
 ---@return selector?
 local function get_data(entity, mode, please)
-    if not supports_mode(entity, mode) then
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
         error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
     end
     -- unit_number is non-nil for all the entities supported by this mod
@@ -400,13 +491,149 @@ end
 ---@param mode action
 ---@param inventory_type? inventory_type
 ---@return boolean
-local function can_safely_set(entity, mode, inventory_type)
-    local data = get_data(entity, mode)
-    local prev_inventory_type = data and data.actual_inventory_type
+local function _can_safely_set(entity, mode, inventory_type)
+    -- Risk only exists for the drop action of inserters when an item is being held
+    if mode ~= "drop" or entity.type ~= "inserter" or not entity.held_stack.valid_for_read then return true end
+    local data = storage.selectors[entity.unit_number]
     -- If no need to set anything, no risk of deadlock
+    return (data and data.actual_inventory_type) == inventory_type
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@return inventory_type?
+local function _get_unsafe(entity, mode)
+    local id = entity.unit_number --[[@as id]]
+    if mode == "pickup" then id = -id end
+    local data = storage.selectors[id]
+    return data and data.actual_inventory_type
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@return inventory_type?
+local function _get_safe(entity, mode)
+    if mode == "drop" then
+        local pending = storage.pending[entity.unit_number --[[@as id]]]
+        if pending then
+            if pending == "clear" then return nil end
+            return pending --[[@as inventory_type]]
+        end
+    end
+    return _get_unsafe(entity, mode)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param immediate? boolean # Reveal the truth to those that can handle it.
+---@return inventory_type?
+local function _get_allow_unsafe(entity, mode, immediate)
+    if immediate then
+        return _get_unsafe(entity, mode)
+    end
+    return _get_safe(entity, mode)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return true
+local function _set_unsafe(entity, mode, inventory_type)
+    local id = entity.unit_number --[[@as id]]
+    if mode == "pickup" then
+        id = -id
+    else
+        -- Clear any pending changes to the drop inventory
+        storage.pending[id] = nil
+    end
+    local data = storage.selectors[id]
+    if not inventory_type then
+        if data then data:destroy() end
+        return true
+    end
+
+    if not data then
+        -- Create a new selector
+        storage.selectors[id] = selector{
+            id=id,
+            entity=entity,
+            mode=mode,
+            inventory_type=inventory_type,
+            actual_inventory_type=inventory_type,
+        }
+        return true
+    end
+
+    if data.inventory_type ~= "circuit" then
+        data.inventory_type = inventory_type
+    end
+
+    local prev_inventory_type = data.actual_inventory_type
     if inventory_type == prev_inventory_type then return true end
 
-    return mode ~= "drop" or entity.type ~= "inserter" or not entity.held_stack.valid_for_read
+    data.actual_inventory_type = inventory_type
+    if prev_inventory_type == "none" then
+        -- If previously "none", then our target may be stale
+        data:update_proxy_target()
+    else
+        -- Otherwise, skip the more expensive target check and just remap the proxy inventory
+        data:update_proxy_inventory()
+    end
+
+    return true
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return boolean # true if the desired setting has been successfully applied (not deferred)
+local function _set_safe(entity, mode, inventory_type)
+    if not _can_safely_set(entity, mode, inventory_type) then
+        storage.pending[entity.unit_number --[[@as id]]] = inventory_type or "clear" -- An intended change to nil is represented with a value of "clear"
+        return false -- Signal a deferred change
+    end
+    return _set_unsafe(entity, mode, inventory_type)
+end
+
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@param immediate? boolean # Throw caution to the wind. Deadlocks build character.
+---@return boolean # true if the desired setting has been successfully applied (not deferred)
+local function _set_allow_unsafe(entity, mode, inventory_type, immediate)
+    if immediate then
+        return _set_unsafe(entity, mode, inventory_type)
+    end
+    return _set_safe(entity, mode, inventory_type)
+end
+
+local _get, _set = _get_allow_unsafe, _set_allow_unsafe
+
+---@param deadlock_safety "always-immediate" | "allow-unsafe" | "always-safe"
+local function rebind_get_set(deadlock_safety)
+    if deadlock_safety == "always-immediate" then
+        _get, _set = _get_unsafe, _set_unsafe
+    elseif deadlock_safety == "always-safe" then
+        _get, _set = _get_safe, _set_safe
+    else
+        _get, _set = _get_allow_unsafe, _set_allow_unsafe
+    end
+end
+rebind_get_set(DEADLOCK_SAFETY)
+
+-- Return true if a call to set() right now with the same parameters would either be deferred or risk deadlocking.
+-- Should never raise an error unless given entity is nil or not valid.
+---@param entity LuaEntity
+---@param mode action
+---@param inventory_type? inventory_type
+---@return boolean
+local function can_safely_set(entity, mode, inventory_type)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    end
+    return _can_safely_set(entity, mode, inventory_type)
 end
 
 -- Get currently assigned inventory type. Specifically, this returns the currently desired inventory assignment, even if it has
@@ -417,22 +644,16 @@ end
 ---@param immediate? boolean # Reveal the truth to those that can handle it.
 ---@return inventory_type?
 local function get(entity, mode, immediate)
-    if DEADLOCK_SAFETY == "always-immediate" then
-        immediate = true
-    elseif DEADLOCK_SAFETY == "always-safe" then
-        immediate = false
-    elseif immediate == nil then -- "allow-unsafe" or "allow-safe"
-        immediate = DEADLOCK_SAFETY ~= "allow-unsafe"
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tag = ((entity.tags or {})["inventory-selector"] --[[@as selector_tag?]] or {})[mode]
+        if tag == "circuit" then return "none" end
+        return tag --[[@as inventory_type?]]
     end
-
-    local data = get_data(entity, mode)
-    if not data then return nil end
-
-    if immediate then return data.actual_inventory_type end
-    local pending = storage.pending[data.id]
-    if not pending then return data.actual_inventory_type end
-    if pending == "clear" then return nil end
-    return pending --[[@as inventory_type]]
+    return _get(entity, mode, immediate)
 end
 
 -- Assign a new inventory type to a selector (or restore its default behavior if nil).
@@ -451,57 +672,31 @@ end
 ---@param immediate? boolean # Throw caution to the wind. Deadlocks build character.
 ---@return boolean # true if the desired setting has been successfully applied (not deferred)
 local function set(entity, mode, inventory_type, immediate)
-    if DEADLOCK_SAFETY == "always-immediate" then
-        immediate = true
-    elseif DEADLOCK_SAFETY == "always-safe" then
-        immediate = false
-    elseif immediate == nil then -- "allow-unsafe" or "allow-safe"
-        immediate = DEADLOCK_SAFETY ~= "allow-unsafe"
-    end
-
-    local data = get_data(entity, mode, "please") --[[@as selector]] -- This won't be nil because we were polite
-    local id = data.id
-
-    if data.inventory_type ~= "circuit" then
-        data.inventory_type = inventory_type
-    end
-
-    -- Check whether the selector is already configured as intended
-    local prev_inventory_type = data.actual_inventory_type
-    if inventory_type == prev_inventory_type then
-        -- Clear pending changes, as there is definitely no need to wait for our intended setting
-        storage.pending[id] = nil
-        if not inventory_type and not data.inventory_type then
-            data:destroy()
-        end
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tags["inventory-selector"] or {}
+        tags["inventory-selector"][mode] = inventory_type
+        entity.tags = tags
         return true
     end
-
-    if not immediate and not can_safely_set(entity, mode, inventory_type) then
-        -- Mitigate a potential deadlock here
-        storage.pending[id] = inventory_type or "clear" -- An intended change to nil is represented with a value of "clear"
-        return false -- Signal a deferred change
-    else
-        storage.pending[id] = nil -- Clear out any pending changes that remain
-    end
-
-    if not inventory_type and not data.inventory_type then
-        data:destroy()
-    elseif data.actual_inventory_type == "none" then
-        data.actual_inventory_type = inventory_type
-        data:update_proxy_target()
-    else
-        data.actual_inventory_type = inventory_type
-        data:update_proxy_inventory()
-    end
-
-    return true
+    return _set(entity, mode, inventory_type, immediate)
 end
 
 ---@param entity LuaEntity
 ---@param mode action
 ---@return boolean
 local function get_circuit_mode(entity, mode)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        return ((entity.tags or {})["inventory-selector"] --[[@as selector_tag?]] or {})[mode] == "circuit"
+    end
     local data = get_data(entity, mode)
     return data and data.inventory_type == "circuit" or false
 end
@@ -512,6 +707,17 @@ end
 ---@param enable? boolean # Defaults to true
 ---@return nil
 local function set_circuit_mode(entity, mode, enable)
+    if not entity or not entity.valid then
+        error("Entity is nil or invalid: " .. serpent.line(entity))
+    elseif not supports_mode(entity, mode) then
+        error("Entity does not support this mode of interaction: " .. entity.name .. ", " .. mode)
+    elseif entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tags["inventory-selector"] or {}
+        tags["inventory-selector"][mode] = enable and "circuit" or "none"
+        entity.tags = tags
+        return
+    end
     if enable == nil then enable = true end
     local data = get_data(entity, mode, "please") --[[@as selector]]
     if enable == (data.inventory_type == "circuit") then return end
@@ -525,72 +731,65 @@ local function set_circuit_mode(entity, mode, enable)
     end
 end
 
--- Handle unexpected loss of an entity
--- This will be triggered by on_object_destroyed, notifying any selectors that may depend on an entity. If a selector no longer depends on the entity, it simply ignores it.
-registry.mourn = function (id, victim)
-    local data = storage.selectors[id]
-    if not data then return end
-    if not data.entity or not data.entity.valid then
-        return data:destroy()
+---@alias selector_tag table<action, inventory_type | "circuit">
+
+---@param entity id | LuaEntity?
+---@return selector_tag?
+local function to_tag(entity)
+    local id = entity
+    local tag
+    if type(entity) ~= "number" then
+        if not entity or not entity.valid then return end
+        tag = entity.tags and entity.tags["inventory-selector"] --[[@as selector_tag?]]
+        if tag then return tag end
+        id = entity.unit_number
+        if not id then return end
     end
-    -- Determine the relationship
-    if victim == id or victim == -id or victim == data.target_id or victim == data.chained_id then
-        -- Victim was the entity controlled by this selector, but is still valid; or
-        -- Victim was the selector's direct target, so try to find a new one; or
-        -- Victim was the selector's chained target, so try to reconnect to an inventory through the proxy
-        return data:update_proxy_target()
+    tag = {}
+    local drop = storage.selectors[id] --[[@as selector?]]
+    if drop then tag.drop = drop.inventory_type end
+    local pickup = storage.selectors[-id] --[[@as selector?]]
+    if pickup then tag.pickup = pickup.inventory_type end
+    if drop or pickup then return tag end
+end
+
+---@param entity LuaEntity?
+---@param tag selector_tag?
+---@return nil
+local function from_tag(entity, tag)
+    if not entity or not entity.valid then return end
+    if entity.type == "entity-ghost" then
+        local tags = entity.tags or {}
+        tags["inventory-selector"] = tag
+        entity.tags = tags
+        return
     end
-    -- No longer relevant, so just ignore it
+
+    local prev_tag = to_tag(entity)
+    local prev_drop = prev_tag and prev_tag.drop
+    local drop = tag and tag.drop
+    if supports_mode(entity, "drop") and prev_drop ~= drop then
+        set_circuit_mode(entity, "drop", drop == "circuit")
+        if drop ~= "circuit" then
+            _set(entity, "drop", drop --[[@as inventory_type?]], true)
+        end
+    end
+    local prev_pickup = prev_tag and prev_tag.pickup
+    local pickup = tag and tag.pickup
+    if supports_mode(entity, "pickup") and prev_pickup ~= pickup then
+        set_circuit_mode(entity, "pickup", pickup == "circuit")
+        if pickup ~= "circuit" then
+            _set(entity, "pickup", pickup --[[@as inventory_type?]], true)
+        end
+    end
 end
 
 -- Handle relevant events
 
-local notify = registry.lose
-
----@alias selector_tags table<action, inventory_type | "circuit">
-
----@param entity id | LuaEntity
----@return selector_tags?
-local function as_tags(entity)
-    if entity and type(entity) ~= "number" then entity = entity.unit_number end
-    if not entity then return end
-    local drop = storage.selectors[entity] --[[@as selector?]]
-    local pickup = storage.selectors[-entity] --[[@as selector?]]
-    if not drop and not pickup then return nil end
-    return {
-        drop = drop and drop.inventory_type,
-        pickup = pickup and pickup.inventory_type,
-    }
-end
-
----@param entity LuaEntity
----@param tags? selector_tags
-local function from_tags(entity, tags)
-    if not entity or not entity.valid then return end
-    if supports_mode(entity, "drop") then
-        local drop = tags and tags.drop
-        if drop == "circuit" then
-            set_circuit_mode(entity, "drop", true)
-        else
-            set_circuit_mode(entity, "drop", false)
-            set(entity, "drop", drop --[[@as inventory_type?]], true)
-        end
-    end
-    if supports_mode(entity, "pickup") then
-        local pickup = tags and tags.pickup
-        if pickup == "circuit" then
-            set_circuit_mode(entity, "pickup", true)
-        else
-            set_circuit_mode(entity, "pickup", false)
-            set(entity, "pickup", pickup --[[@as inventory_type?]], true)
-        end
-    end
-end
-
 ---@param from LuaEntity
 ---@param to LuaEntity
 local function copy_settings(from, to)
-    return from_tags(to, as_tags(from))
+    return from_tag(to, to_tag(from))
 end
 
 local function on_object_destroyed(event)
@@ -615,10 +814,19 @@ local function on_post_entity_died(event)
     local ghost = event.ghost --[[@as LuaEntity?]]
     if ghost and ghost.valid then
         local tags = ghost.tags or {}
-        tags["inventory-selector"] = as_tags(ghost.ghost_unit_number)
+        tags["inventory-selector"] = to_tag(ghost.ghost_unit_number)
         ghost.tags = tags
     end
     return notify(event.unit_number)
+end
+
+---@param event EventData.on_player_mined_entity | EventData.on_robot_mined_entity | EventData.on_space_platform_mined_entity
+local function on_mined_entity(event)
+    local entity = event.entity
+    local tag = entity and entity.valid and to_tag(entity)
+    if not tag then return end
+    if not storage.replacing then storage.replacing = {} end
+    storage.replacing[entity.gps_tag] = { tag = tag, tick = event.tick }
 end
 
 ---@param event EventData.on_player_setup_blueprint
@@ -629,18 +837,25 @@ local function on_player_setup_blueprint(event)
     for _, bpe in ipairs(record.get_blueprint_entities() or {}) do
         local id = bpe.entity_number
         local entity = mapping[id]
-        local tags = entity and entity.valid and as_tags(entity)
-        if tags then
-            record.set_blueprint_entity_tag(id, "inventory-selector", tags)
+        local tag = entity and entity.valid and to_tag(entity)
+        if tag then
+            record.set_blueprint_entity_tag(id, "inventory-selector", tag)
         end
     end
 end
 
 ---@param event EventData.on_built_entity | EventData.on_robot_built_entity | EventData.on_space_platform_built_entity | EventData.script_raised_revive
 local function on_built_entity(event)
-    local entity, tags = event.entity, event.tags
-    if not entity or not entity.valid or not tags then return end
-    return from_tags(entity, tags["inventory-selector"]--[[@as selector_tags?]])
+    local entity = event.entity
+    if not entity or not entity.valid then return end
+    local tag = event.tags and event.tags["inventory-selector"] --[[@as selector_tag?]]
+    if not tag then
+        -- No event tags, maybe fast replace?
+        local replace = storage.replacing and storage.replacing[entity.gps_tag]
+        if replace and replace.tick == event.tick then tag = replace.tag end
+    end
+    if not tag then return end
+    return from_tag(entity, tag)
 end
 
 local function tick_pending()
@@ -666,6 +881,7 @@ local function tick_floating()
             data:update_proxy_target()
         end
     end
+    storage.replacing = {}
 end
 
 local function tick_circuit()
@@ -829,6 +1045,10 @@ local library = {
         ---@type table<id, inventory_type | "clear">
         storage.pending = {}
 
+        -- Maps GPS tags to selector tags and event tick to use when upgrading or fast replacing entities.
+        ---@type table<string, { tag: selector_tag, tick: MapTick }>
+        storage.replacing = {}
+
         -- Maps unit numbers (or useful_ids in general) of entities to the set of selectors that would care if that entity went
         -- away. We generally don't expect selectors to remove their entries here if they become no longer relevant, as that could
         -- lead to messy edge cases such as when a selector depends on the same entity for multiple reasons and only one of those
@@ -866,6 +1086,9 @@ local library = {
         [defines.events.on_entity_cloned] = on_entity_settings_pasted,
         [defines.events.on_entity_settings_pasted] = on_entity_settings_pasted,
         [defines.events.on_post_entity_died] = on_post_entity_died,
+        [defines.events.on_player_mined_entity] = on_mined_entity,
+        [defines.events.on_robot_mined_entity] = on_mined_entity,
+        [defines.events.on_space_platform_mined_entity] = on_mined_entity,
         [defines.events.on_built_entity] = on_built_entity,
         [defines.events.on_robot_built_entity] = on_built_entity,
         [defines.events.on_space_platform_built_entity] = on_built_entity,
@@ -905,6 +1128,7 @@ local library = {
 
             if event.setting == "inventory-selector-deadlock-safety" then
                 DEADLOCK_SAFETY = settings.global["inventory-selector-deadlock-safety"].value --[[@as "always-immediate" | "allow-unsafe" | "always-safe"]]
+                rebind_get_set(DEADLOCK_SAFETY)
             elseif event.setting == "inventory-selector-enable-circuit" then
                 ENABLE_CIRCUIT = settings.global["inventory-selector-enable-circuit"].value --[[@as boolean]]
             elseif event.setting == "inventory-selector-pending-retry-ticks" then
