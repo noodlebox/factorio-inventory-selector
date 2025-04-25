@@ -8,6 +8,10 @@ local FLOATING_RETRY_TICKS = settings.global["inventory-selector-floating-retry-
 local UPDATE_CIRCUIT_TICKS = settings.global["inventory-selector-update-circuit-ticks"].value --[[@as integer]]
 local DEBUG = settings.global["inventory-selector-enable-debug"].value --[[@as boolean]]
 
+-- A unique identifier for selectors. Derived from `LuaEntity::unit_number`, which the docs say is a uint64. This mod uses
+-- `unit_number` to represent selectors for the drop action of an entity and `-unit_number` for the pickup action. Technically,
+-- this means "collisions" are possible: either an inserter has a `unit_number` of `0` (it won't) or an entity has a `unit_number`
+-- larger than `2^63` (at which point, far more will have already been broken by numeric precision limitations of Lua).
 ---@alias id integer
 ---@alias action "drop" | "pickup"
 
@@ -89,6 +93,11 @@ registry.remember = function (id, target)
     end
 end
 
+-------------------------------------------------------------------------------
+-- Selector state
+-------------------------------------------------------------------------------
+
+-- A selector contains the configuration data for one interaction mode of a single entity. Inserters may have up to two of these.
 ---@class selector
 -- A constant unique key among selectors, the index used as the key for various dictionaries tracking their state.
 -- It is derived from the unit number of the entity it controls and its mode of action:
@@ -104,6 +113,7 @@ end
 -- The configured inventory restriction, if any. Uses a "unified" inventory type name, which may map to distinct inventory indices across different entity types.
 -- This is the only meaningful way to refer to a selected inventory across this mod's API.
 -- Some special values are possible:
+--
 -- - "circuit" indicates that this selector's configuration should be determined by the connected circuit network. Behaves as "none" if no circuit network is connected.
 -- - nil indicates that the entity should use its built-in default behavior if possible, as if this selector did not exist.
 ---@field inventory_type? inventory_type | "circuit"
@@ -111,6 +121,12 @@ end
 ---@field actual_inventory_type? inventory_type
 -- An instance of the hidden proxy entity, through which all interaction between `entity` and `target` is mediated.
 -- This only supports interaction through this mod's provided APIs. Any external interaction otherwise may cause undefined behavior.
+-- Most of this mod blindly assumes that proxies are always valid, with the expectation that errors will be raised if this is not the case.
+-- They should never by externally teleported, cloned, or blueprinted. This mod will create and destroy them as needed.
+--
+-- NOTE: It is not always possible (starting in 2.0.44) to prevent entities from automatically selecting a proxy as their pickup target and this may lead to unexpected behavior.
+--       Protecting them against unintended use as drop targets is possible, but this depends on functionality that is considered a "bug", so may break in the future.
+--       Hopefully, official support for this functionality will be provided in the future. (See: https://forums.factorio.com/viewtopic.php?t=128082)
 ---@field proxy LuaEntity
 -- The "apparent" target of this entity, which would be assumed to be the true target of interaction for this entity. When this selector is active, all interaction with this target is managed through the proxy entity.
 -- A direct reference to this entity is maintained to allow for convenient assignment to the proxy entity as needed, as well as shared through the APIs to permit other mods to read a entity's apparent target, even when this connection is simulated by mediated interaction with the proxy here.
@@ -129,8 +145,11 @@ local selector = {}
 selector = setmetatable(selector, { __call = function (cls, obj) return setmetatable(obj or {}, cls):init() end })
 selector.__index = selector
 
+-- Register the metatable because selectors end up in `storage`
 script.register_metatable("inventory-selector", selector)
 
+-- At time of creation, selectors should have at least a valid id, entity, and mode
+-- Its target will be detected if present, and if there is an actual_inventory_type, it will be connected
 ---@return selector
 function selector:init()
     local entity = self.entity
@@ -202,6 +221,9 @@ function selector:connect_proxy(state, expect)
         error("Entity and proxy unexpectedly " .. (pre_state and "" or "dis") .. "connected: " .. serpent.line(self))
     end
 
+    -- Handle change in force of the entity (to ensure it can still attach to the proxy)
+    -- FIXME: This should be necessary almost never, and might be better handled by extending the remember/notify system to handle
+    --        objects other than entities (like forces and surfaces).
     proxy.force = entity.force
     proxy.teleport(position)
     if state then
@@ -231,7 +253,13 @@ end
 ---@return selector
 function selector:update_proxy_inventory()
     local target = self.target
-    if target and not target.valid then return self:update_proxy_target() end
+    if target and not target.valid then
+        -- FIXME: This is possible during large batches of events raised in an inconvenient order (where a less-important entity is handled first).
+        --        That logic should be improved by batching handling of mass events, which may also improve performance, so long as edge cases are handled.
+        --if not DEBUG then return self:update_proxy_target() end
+        --error(string.format("Selector %q has an invalid target: %s", self.id, serpent.line(target)))
+        return self:update_proxy_target()
+    end
     local index = nil
     local inventory_type = self.actual_inventory_type
     local proxy = self.proxy
