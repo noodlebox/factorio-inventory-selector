@@ -74,33 +74,88 @@ local function is_inside(position, region)
     return position.x >= a0.x and position.x <= a1.x and position.y >= a0.y and position.y <= a1.y
 end
 
--- Keep track of important entity relationships so their loss can be handled gracefully.
-local registry = {}
-
--- Dispatch notifications for the loss of an entity
----@param victim id
-registry.lose = function (victim)
-    local mourners = storage.mourners[victim]
-    storage.mourners[victim] = nil
-    if not mourners then return end
-
-    if not registry.mourn then return end
-    for mourner in pairs(mourners) do
-        registry.mourn(mourner, victim)
-    end
-end
+-------------------------------------------------------------------------------
+-- Entity relationship tracking
+-------------------------------------------------------------------------------
 
 ---@param id id
----@param target LuaEntity
-registry.remember = function (id, target)
-    if not target or not target.valid then return end
-    local _, target_id = script.register_on_object_destroyed(target)
-    --local target_id = target.unit_number --[[@as id]]
+---@param target LuaEntity # This should be an entity with a valid unit_number
+local function remember(id, target)
+    if not target or not target.valid then
+        if not DEBUG then return end
+        error(string.format("Selector %q is trying to track an invalid entity: %s", id, serpent.line(target)))
+    end
+    -- Events other than on_object_destroyed may also interact with this system, so unit_number is preferable to registration number
+    local target_id = target.unit_number
+    -- If an entity cannot be identified by unit_number, it shouldn't be tracked here. This should not happen in general.
+    if not target_id then
+        if not DEBUG then return end
+        error(string.format("Selector %q is trying to track an entity without a unit_number: %s", id, serpent.line(target)))
+    end
+    script.register_on_object_destroyed(target)
+
     local mourners = storage.mourners[target_id]
     if not mourners then
         storage.mourners[target_id] = { [id] = true }
     else
         mourners[id] = true
+    end
+end
+
+-- Handle unexpected loss of an entity
+-- This will be triggered by on_object_destroyed, notifying any selectors that may depend on an entity. If a selector no longer depends on the entity, it simply ignores it.
+-- This is also called when "victim" is modified in some way that may render a selector invalid for some reason.
+-- Handling one of these events will fall into one of these four categories, in order of increasing severity:
+-- - No action required (e.g. victim was a stale reference to an old target)
+-- - The targeted inventory should be re-evaluated (e.g. the target is a proxy container whose own target may have changed)
+-- - The target itself may have changed (e.g. either the mourner or its target have moved)
+-- - The selector should be destroyed (e.g. the mourner itself is no longer valid)
+-- Any of these should behave in an idempotent manner, allowing for straightforward handling of events immediately as they come in,
+-- though possibly with some redundant work.
+--
+-- A smarter implementation might batch these actions together, applying only the most severe resolution necessary (as each also
+-- ensures that any "lesser" issues would be resolved if present). The tricky part of this approach would be ensuring that batched
+-- actions were still performed on same tick, as there is no guarantee of event order relative to `on_tick`.
+---@param mourner id # Selector's id
+---@param victim id # Generally this should be a valid unit_number
+local function mourn(mourner, victim)
+    local data = storage.selectors[mourner]
+
+    -- If the mourner is already gone, then there's nothing to do.
+    if not data then return end
+
+    -- Regardless of the victim's relationship to the mourner, validate its entity references.
+
+    -- If the mourner's entity is no longer valid, it should be cleaned up.
+    if not data.entity or not data.entity.valid then return data:destroy() end
+    -- If the mourner's target is no longer valid, it should attempt to find a new one.
+    if data.target and not data.target.valid then return data:update_proxy_target() end
+
+    -- Determine the relationship to the mourner
+    if victim == mourner or victim == -mourner or victim == data.target_id then
+        -- A change to the mourner itself or its direct target requires checking that the target is still within reach.
+        return data:update_proxy_target()
+    elseif victim == data.chained_id then
+        -- A change to the mourner's indirect (chained) target requires simply updating the proxy configuration.
+        return data:update_proxy_inventory()
+    end
+    -- No longer relevant, so just ignore it
+end
+
+-- Dispatch notifications for the loss of an entity
+---@param victim id
+local function notify(victim)
+    -- Technically, victim could be anything. It's exposed to the external API to allow other mods to attempt to work
+    -- cooperatively, but in general this should be a unit_number. It is possible for unit_number to be nil for certain
+    -- entities, but none of those should matter to this mod.
+    if not victim then return end
+
+    local mourners = storage.mourners[victim]
+    storage.mourners[victim] = nil
+    if not mourners then return end
+
+    for mourner in pairs(mourners) do
+        mourn(mourner, victim)
     end
 end
 
@@ -284,7 +339,7 @@ function selector:update_proxy_inventory()
         index = chained_index
 
         -- Track the secondary target as well
-        registry.remember(self.id, chained)
+        remember(self.id, chained)
         self.chained_id = chained.unit_number--[[@as id]]
     end
 
@@ -327,7 +382,7 @@ function selector:update_proxy_target(target)
     local entity = self.entity
     local mode = self.mode
 
-    registry.remember(id, entity)
+    remember(id, entity)
 
     target = target or self.target
 
@@ -384,7 +439,7 @@ function selector:update_proxy_target(target)
 
     self.target = target
     self.target_id = target and target.unit_number
-    if target then registry.remember(id, target) end
+    if target then remember(id, target) end
 
     return self:update_proxy_inventory()
 end
@@ -729,27 +784,7 @@ local function from_tag(entity, tag)
     end
 end
 
--- Handle unexpected loss of an entity
--- This will be triggered by on_object_destroyed, notifying any selectors that may depend on an entity. If a selector no longer depends on the entity, it simply ignores it.
-registry.mourn = function (id, victim)
-    local data = storage.selectors[id]
-    if not data then return end
-    if not data.entity or not data.entity.valid then
-        return data:destroy()
-    end
-    -- Determine the relationship
-    if victim == id or victim == -id or victim == data.target_id or victim == data.chained_id then
-        -- Victim was the entity controlled by this selector, but is still valid; or
-        -- Victim was the selector's direct target, so try to find a new one; or
-        -- Victim was the selector's chained target, so try to reconnect to an inventory through the proxy
-        return data:update_proxy_target()
-    end
-    -- No longer relevant, so just ignore it
-end
-
 -- Handle relevant events
-
-local notify = registry.lose
 
 ---@param from LuaEntity
 ---@param to LuaEntity
