@@ -45,6 +45,17 @@ local function write_target(entity, mode, new_target)
     end
 end
 
+-- Test whether two `LuaEntity` instances refer to the same entity (by `unit_number`).
+-- Returns false if either is nil, invalid, or does not have a unit_number.
+---@param a LuaEntity?
+---@param b LuaEntity?
+---@return boolean
+local function is_same(a, b)
+    if not a or not b or not a.valid or not b.valid then return false end
+    local ai, bi = a.unit_number, b.unit_number
+    return ai and ai == bi or false
+end
+
 ---@param position MapPosition
 ---@return BoundingBox
 local function get_tile(position)
@@ -185,7 +196,7 @@ function selector:destroy()
     -- Restore direct connection to the target entity, if appropriate
     if self.entity then
         if self.entity.valid then
-            self:connect_proxy(false)
+            self:disconnect_proxy()
         end
         self.entity = nil
     end
@@ -197,50 +208,41 @@ function selector:destroy()
     if proxy and proxy.valid then proxy.destroy() end
 end
 
--- Connect an entity with its proxy or bypass it to connect with its target.
--- If DEBUG is enabled, this will not attempt to reassign the target if assumed not necessary.
--- It will confirm whether the connection ends in the intended state in either case, raising an error if not.
----@param state? boolean # Defaults to true, which will connect the entity to its proxy. If false, disconnects the entity from its proxy (and connects it to its target directly).
----@param expect? boolean # If given, checks assumptions for debugging, to potentially expose faults in implementation that could otherwise go unnoticed in most normal use.
+-- Connect an entity with its proxy (whether newly set up or possibly "detached" by entity movement).
 ---@return selector
-function selector:connect_proxy(state, expect)
-    if state == nil then state = true end
-    if not DEBUG then expect = nil end
-
-    local entity = self.entity
-    local mode = self.mode
-    local proxy = self.proxy
-    local target = self.target
-
-    local pre_target, position = read_target(entity, mode)
-    ---@type boolean|nil
-    local pre_state = pre_target == proxy
-    if not pre_state and pre_target ~= target then pre_state = nil end
-
-    if expect == state and state ~= pre_state then
-        error("Entity and proxy unexpectedly " .. (pre_state and "" or "dis") .. "connected: " .. serpent.line(self))
-    end
+function selector:connect_proxy()
+    local entity, mode, proxy = self.entity, self.mode, self.proxy
 
     -- Handle change in force of the entity (to ensure it can still attach to the proxy)
     -- FIXME: This should be necessary almost never, and might be better handled by extending the remember/notify system to handle
     --        objects other than entities (like forces and surfaces).
     proxy.force = entity.force
-    proxy.teleport(position)
-    if state then
+
+    local raw_target, position = read_target(entity, mode)
+    if not is_same(raw_target, proxy) then
+        proxy.teleport(position) -- TODO: Measure performance impact of doing this unconditionally vs comparing position first
         write_target(entity, mode, proxy)
-    else
-        write_target(entity, mode, target)
     end
 
-    if expect == nil then return self end
+    return self
+end
 
-    local post_target = read_target(entity, mode)
-    ---@type boolean|nil
-    local post_state = post_target == proxy
-    if not post_state and post_target ~= target then post_state = nil end
+-- Disconnect an entity from its proxy and attempt to connect directly to its "apparent" target, if any.
+-- This doesn't *need* to end up with the same target, as this mod's idea of a "valid" target does not overlap perfectly with that
+-- of the base game, but it definitely shouldn't be connected to the proxy anymore.
+--
+-- FIXME: We *should* try to confirm this entity does not end up automatically connected to this (or any other) proxy after this.
+--        Unfortunately, we can't know which target will be selected automatically until a later tick, so we should schedule a
+--        check to catch any odd edge cases that pop up. These *should* be rare though, as there should almost always be a valid
+--        target present wherever a proxy exists, with "floating" selectors being the main exception (and there aren't any great
+--        solutions to that with reasonable performance).
+---@return selector
+function selector:disconnect_proxy()
+    local entity, mode, proxy, target = self.entity, self.mode, self.proxy, self.target
 
-    if state ~= post_state then
-        error("Entity failed to " .. (state and "" or "dis") .. "connect with proxy: " .. serpent.line(self))
+    local raw_target = read_target(entity, mode)
+    if is_same(raw_target, proxy) then
+        write_target(entity, mode, target)
     end
 
     return self
@@ -300,7 +302,11 @@ function selector:update_proxy_inventory()
     proxy.proxy_target_entity = target
     proxy.proxy_target_inventory = index
 
-    self:connect_proxy(inventory_type ~= nil)
+    if inventory_type then
+        self:connect_proxy()
+    else
+        self:disconnect_proxy()
+    end
 
     -- Force entity to wake up if sleeping
     self.entity.active = false
