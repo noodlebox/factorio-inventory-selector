@@ -1,4 +1,13 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2025-04-25
+  Features:
+    - Allow configuration of ghost entities ([#3](https://github.com/noodlebox/factorio-inventory-selector/issues/3))
+    - Preserve configuration when fast-replacing entities ([#3](https://github.com/noodlebox/factorio-inventory-selector/issues/3))
+  Bugfixes:
+    - Crash on unidentifiable victim entities
+    - Typo causing potential crash on interaction with other mod GUIs
+---------------------------------------------------------------------------------------------------
 Version: 1.0.2
 Date: 2025-04-16
   Optimizations:
