@@ -140,7 +140,7 @@ local function render_on(parent, anchor)
         }.tags = { mode = "drop", action = "inventory" }
     end
 
-    if ENABLE_CIRCUIT then
+    if ENABLE_CIRCUIT and circuit_connected then
         local circuit_content = parent.add{
             anchor = anchor,
             type = "frame",
